@@ -4,6 +4,7 @@
 #endif
 
 #include "drm.h"
+#include "string.h"
 
 extern "C" {
     #include <libavutil/hwcontext_drm.h>
@@ -11,7 +12,6 @@ extern "C" {
 
 #include <libdrm/drm_fourcc.h>
 #include <linux/dma-buf.h>
-#include <sys/ioctl.h>
 
 // Special Rockchip type
 #ifndef DRM_FORMAT_NA12
@@ -81,6 +81,7 @@ DrmRenderer::DrmRenderer(bool hwaccel, IFFmpegRenderer *backendRenderer)
       m_ColorRangeProp(nullptr),
       m_HdrOutputMetadataProp(nullptr),
       m_ColorspaceProp(nullptr),
+      m_Version(nullptr),
       m_HdrOutputMetadataBlobId(0),
       m_SwFrameMapper(this),
       m_CurrentSwFrameIdx(0)
@@ -140,6 +141,10 @@ DrmRenderer::~DrmRenderer()
         drmModeFreePlane(m_Plane);
     }
 
+    if (m_Version != nullptr) {
+        drmFreeVersion(m_Version);
+    }
+
     if (m_HwContext != nullptr) {
         av_buffer_unref(&m_HwContext);
     }
@@ -153,7 +158,8 @@ bool DrmRenderer::prepareDecoderContext(AVCodecContext* context, AVDictionary** 
 {
     // The out-of-tree LibreELEC patches use this option to control the type of the V4L2
     // buffers that we get back. We only support NV12 buffers now.
-    av_dict_set_int(options, "pixel_format", AV_PIX_FMT_NV12, 0);
+    if(strstr(context->codec->name, "_v4l2") != NULL)
+        av_dict_set_int(options, "pixel_format", AV_PIX_FMT_NV12, 0);
 
     // This option controls the pixel format for the h264_omx and hevc_omx decoders
     // used by the JH7110 multimedia stack. This decoder gives us software frames,
@@ -251,6 +257,18 @@ bool DrmRenderer::initialize(PDECODER_PARAMETERS params)
             return false;
         }
     }
+
+    // Fetch version details about the DRM driver to use later
+    m_Version = drmGetVersion(m_DrmFd);
+    if (m_Version == nullptr) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "drmGetVersion() failed: %d",
+                     errno);
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "GPU driver: %s", m_Version->name);
 
     // Create the device context first because it is needed whether we can
     // actually use direct rendering or not.
@@ -577,6 +595,35 @@ int DrmRenderer::getRendererAttributes()
     // This renderer does not buffer any frames in the graphics pipeline
     attributes |= RENDERER_ATTRIBUTE_NO_BUFFERING;
 
+#ifdef GL_IS_SLOW
+    // Restrict streaming resolution to 1080p on the Pi 4 while in the desktop environment.
+    // EGL performance is extremely poor and just barely hits 1080p60 on Bookworm. This also
+    // covers the MMAL H.264 case which maxes out at 1080p60 too.
+    if (!m_SupportsDirectRendering &&
+            (strcmp(m_Version->name, "vc4") == 0 || strcmp(m_Version->name, "v3d") == 0) &&
+            qgetenv("RPI_ALLOW_EGL_4K") != "1") {
+        drmDevicePtr device;
+
+        if (drmGetDevice(m_DrmFd, &device) == 0) {
+            if (device->bustype == DRM_BUS_PLATFORM) {
+                for (int i = 0; device->deviceinfo.platform->compatible[i]; i++) {
+                    QString compatibleId(device->deviceinfo.platform->compatible[i]);
+                    if (compatibleId == "brcm,bcm2835-vc4" || compatibleId == "brcm,bcm2711-vc5" || compatibleId == "brcm,2711-v3d") {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Streaming resolution is limited to 1080p on the Pi 4 inside the desktop environment!");
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Run Moonlight directly from the console to stream above 1080p resolution!");
+                        attributes |= RENDERER_ATTRIBUTE_1080P_MAX;
+                        break;
+                    }
+                }
+            }
+
+            drmFreeDevice(&device);
+        }
+    }
+#endif
+
     return attributes;
 }
 
@@ -798,7 +845,7 @@ bool DrmRenderer::mapSoftwareFrame(AVFrame *frame, AVDRMFrameDescriptor *mappedF
         // Prepare to write to the dumb buffer from the CPU
         struct dma_buf_sync sync;
         sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
-        ioctl(drmFrame->primeFd, DMA_BUF_IOCTL_SYNC, &sync);
+        drmIoctl(drmFrame->primeFd, DMA_BUF_IOCTL_SYNC, &sync);
 
         int lastPlaneSize = 0;
         for (int i = 0; i < 4; i++) {
@@ -852,7 +899,7 @@ bool DrmRenderer::mapSoftwareFrame(AVFrame *frame, AVDRMFrameDescriptor *mappedF
 
         // End the CPU write to the dumb buffer
         sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
-        ioctl(drmFrame->primeFd, DMA_BUF_IOCTL_SYNC, &sync);
+        drmIoctl(drmFrame->primeFd, DMA_BUF_IOCTL_SYNC, &sync);
     }
 
     ret = true;
@@ -1143,14 +1190,16 @@ bool DrmRenderer::isDirectRenderingSupported()
 
 int DrmRenderer::getDecoderColorspace()
 {
-    // Some DRM implementations (VisionFive) don't support BT.601 color encoding,
-    // so let's default to BT.709, which all drivers that support COLOR_ENCODING
-    // seem to support.
-    //
-    // If COLOR_ENCODING is not supported, we'll use BT.601 which appears to be
-    // the default on drivers that don't support COLOR_ENCODING, such as Rockchip
-    // per https://github.com/torvalds/linux/commit/1c21aa8f2b687cebfeff9736d60303a14bf32768
-    return m_ColorEncodingProp ? COLORSPACE_REC_709 : COLORSPACE_REC_601;
+    // The starfive driver used on the VisionFive 2 doesn't support BT.601,
+    // so we will use BT.709 instead. Rockchip doesn't support BT.709, even
+    // in some cases where it exposes COLOR_ENCODING properties, so we stick
+    // to BT.601 which seems to be the default for YUV planes on Linux.
+    if (strcmp(m_Version->name, "starfive") == 0) {
+        return COLORSPACE_REC_709;
+    }
+    else {
+        return COLORSPACE_REC_601;
+    }
 }
 
 const char* DrmRenderer::getDrmColorEncodingValue(AVFrame* frame)
@@ -1190,6 +1239,23 @@ bool DrmRenderer::canExportEGL() {
                     "Using direct rendering for HDR support");
         return false;
     }
+
+#if defined(HAVE_MMAL) && !defined(ALLOW_EGL_WITH_MMAL)
+    // EGL rendering is so slow on the Raspberry Pi 4 that we should basically
+    // never use it. It is suitable for 1080p 30 FPS on a good day, and much
+    // much less than that if you decide to do something crazy like stream
+    // in full-screen. MMAL is the ideal rendering API for Buster and Bullseye,
+    // but it's gone in Bookworm. Fortunately, Bookworm has a more efficient
+    // rendering pipeline that makes EGL mostly usable as long as we stick
+    // to a 1080p 60 FPS maximum.
+    if (qgetenv("RPI_ALLOW_EGL_RENDER") != "1") {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Disabling EGL rendering due to low performance on Raspberry Pi 4");
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Set RPI_ALLOW_EGL_RENDER=1 to override");
+        return false;
+    }
+#endif
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "DRM backend supports exporting EGLImage");

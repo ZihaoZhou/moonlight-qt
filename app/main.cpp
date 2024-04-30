@@ -10,7 +10,7 @@
 #include <QFont>
 #include <QCursor>
 #include <QElapsedTimer>
-#include <QFile>
+#include <QTemporaryFile>
 
 // Don't let SDL hook our main function, since Qt is already
 // doing the same thing. This needs to be before any headers
@@ -61,7 +61,7 @@
 
 #ifdef USE_CUSTOM_LOGGER
 static QElapsedTimer s_LoggerTime;
-static QTextStream s_LoggerStream(stdout);
+static QTextStream s_LoggerStream(stderr);
 static QMutex s_LoggerLock;
 static bool s_SuppressVerboseOutput;
 #ifdef LOG_TO_FILE
@@ -351,6 +351,11 @@ int main(int argc, char *argv[])
     SSL_free(nullptr);
 #endif
 
+    // We keep this at function scope to ensure it stays around while we're running,
+    // becaue the Qt QPA will need to read it. Since the temporary file is only
+    // created when open() is called, this doesn't do any harm for other platforms.
+    QTemporaryFile eglfsConfigFile("eglfs_override_XXXXXX.conf");
+
     // Avoid using High DPI on EGLFS. It breaks font rendering.
     // https://bugreports.qt.io/browse/QTBUG-64377
     //
@@ -372,6 +377,7 @@ int main(int argc, char *argv[])
         if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
             qInfo() << "Unable to detect Wayland or X11, so EGLFS will be used by default. Set QT_QPA_PLATFORM to override this.";
             qputenv("QT_QPA_PLATFORM", "eglfs");
+            qputenv("SDL_VIDEODRIVER", "kmsdrm");
 
             if (!qEnvironmentVariableIsSet("QT_QPA_EGLFS_ALWAYS_SET_MODE")) {
                 qInfo() << "Setting display mode by default. Set QT_QPA_EGLFS_ALWAYS_SET_MODE=0 to override this.";
@@ -383,6 +389,17 @@ int main(int argc, char *argv[])
             if (!QFile("/dev/dri").exists()) {
                 qWarning() << "Unable to find a KMSDRM display device!";
                 qWarning() << "On the Raspberry Pi, you must enable the 'fake KMS' driver in raspi-config to use Moonlight outside of the GUI environment.";
+            }
+            else if (!qEnvironmentVariableIsSet("QT_QPA_EGLFS_KMS_CONFIG")) {
+                // HACK: Remove this when Qt is fixed to properly check for display support before picking a card
+                QString cardOverride = WMUtils::getDrmCardOverride();
+                if (!cardOverride.isEmpty()) {
+                    if (eglfsConfigFile.open()) {
+                        qInfo() << "Overriding default Qt EGLFS card selection to" << cardOverride;
+                        QTextStream(&eglfsConfigFile) << "{ \"device\": \"" << cardOverride << "\" }";
+                        qputenv("QT_QPA_EGLFS_KMS_CONFIG", eglfsConfigFile.fileName().toUtf8());
+                    }
+                }
             }
         }
 
@@ -416,6 +433,12 @@ int main(int argc, char *argv[])
     // NB: Windows defaults to the "windows" non-threaded render loop on
     // Qt 5 and the threaded render loop on Qt 6.
     qputenv("QSG_RENDER_LOOP", "basic");
+#endif
+
+#if defined(Q_OS_DARWIN) && defined(QT_DEBUG)
+    // Enable Metal valiation for debug builds
+    qputenv("MTL_DEBUG_LAYER", "1");
+    qputenv("MTL_SHADER_VALIDATION", "1");
 #endif
 
     // We don't want system proxies to apply to us
@@ -496,6 +519,13 @@ int main(int argc, char *argv[])
     // SDL doing it for us behind our backs.
     SDL_SetHint("SDL_MOUSE_AUTO_CAPTURE", "0");
 
+    // SDL will try to lock the mouse cursor on Wayland if it's not visible in order to
+    // support applications that assume they can warp the cursor (which isn't possible
+    // on Wayland). We don't want this behavior because it interferes with seamless mouse
+    // mode when toggling between windowed and fullscreen modes by unexpectedly locking
+    // the mouse cursor.
+    SDL_SetHint("SDL_VIDEO_WAYLAND_EMULATE_MOUSE_WARP", "0");
+
 #ifdef QT_DEBUG
     // Allow thread naming using exceptions on debug builds. SDL doesn't use SEH
     // when throwing the exceptions, so we don't enable it for release builds out
@@ -547,8 +577,7 @@ int main(int argc, char *argv[])
                 runtimeVersion.major, runtimeVersion.minor, runtimeVersion.patch);
 
     // Apply the initial translation based on user preference
-    StreamingPreferences prefs;
-    prefs.retranslate();
+    StreamingPreferences::get()->retranslate();
 
     // Trickily declare the translation for dialog buttons
     QCoreApplication::translate("QPlatformTheme", "&Yes");
@@ -613,8 +642,8 @@ int main(int argc, char *argv[])
     qmlRegisterUncreatableType<Session>("Session", 1, 0, "Session", "Session cannot be created from QML");
     qmlRegisterSingletonType<ComputerManager>("ComputerManager", 1, 0,
                                               "ComputerManager",
-                                              [](QQmlEngine*, QJSEngine*) -> QObject* {
-                                                  return new ComputerManager();
+                                              [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
+                                                  return new ComputerManager(StreamingPreferences::get(qmlEngine));
                                               });
     qmlRegisterSingletonType<AutoUpdateChecker>("AutoUpdateChecker", 1, 0,
                                                 "AutoUpdateChecker",
@@ -628,13 +657,13 @@ int main(int argc, char *argv[])
                                                });
     qmlRegisterSingletonType<SdlGamepadKeyNavigation>("SdlGamepadKeyNavigation", 1, 0,
                                                       "SdlGamepadKeyNavigation",
-                                                      [](QQmlEngine*, QJSEngine*) -> QObject* {
-                                                          return new SdlGamepadKeyNavigation();
+                                                      [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
+                                                          return new SdlGamepadKeyNavigation(StreamingPreferences::get(qmlEngine));
                                                       });
     qmlRegisterSingletonType<StreamingPreferences>("StreamingPreferences", 1, 0,
                                                    "StreamingPreferences",
                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
-                                                       return new StreamingPreferences(qmlEngine);
+                                                       return StreamingPreferences::get(qmlEngine);
                                                    });
 
     // Create the identity manager on the main thread
@@ -665,7 +694,7 @@ int main(int argc, char *argv[])
     case GlobalCommandLineParser::StreamRequested:
         {
             initialView = "qrc:/gui/CliStartStreamSegue.qml";
-            StreamingPreferences* preferences = new StreamingPreferences(&app);
+            StreamingPreferences* preferences = StreamingPreferences::get();
             StreamCommandLineParser streamParser;
             streamParser.parse(app.arguments(), preferences);
             QString host    = streamParser.getHost();
@@ -697,7 +726,7 @@ int main(int argc, char *argv[])
             ListCommandLineParser listParser;
             listParser.parse(app.arguments());
             auto launcher = new CliListApps::Launcher(listParser.getHost(), listParser, &app);
-            launcher->execute(new ComputerManager(&app));
+            launcher->execute(new ComputerManager(StreamingPreferences::get()));
             hasGUI = false;
             break;
         }

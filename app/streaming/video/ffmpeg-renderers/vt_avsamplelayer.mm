@@ -301,7 +301,18 @@ public:
                 m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
                 break;
             case COLORSPACE_REC_2020:
-                m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
+                // This is necessary to ensure HDR works properly with external displays on macOS Sonoma.
+                if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
+                    if (@available(macOS 11.0, *)) {
+                        m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+                    }
+                    else {
+                        m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
+                    }
+                }
+                else {
+                    m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
+                }
                 break;
             case COLORSPACE_REC_601:
                 m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -596,7 +607,7 @@ public:
         context->hw_device_ctx = av_buffer_ref(m_HwContext);
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Using VideoToolbox accelerated renderer");
+                    "Using VideoToolbox AVSampleBufferDisplayLayer renderer");
 
         return true;
     }

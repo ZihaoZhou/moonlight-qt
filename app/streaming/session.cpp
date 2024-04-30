@@ -52,6 +52,7 @@
 #include <QGuiApplication>
 #include <QCursor>
 #include <QWindow>
+#include <QScreen>
 
 #define CONN_TEST_SERVER "qt.conntest.moonlight-stream.org"
 
@@ -132,7 +133,11 @@ void Session::clConnectionTerminated(int errorCode)
 
     default:
         s_ActiveSession->m_UnexpectedTermination = true;
-        emit s_ActiveSession->displayLaunchError(tr("Connection terminated"));
+
+        // We'll assume large errors are hex values
+        bool hexError = qAbs(errorCode) > 1000;
+        emit s_ActiveSession->displayLaunchError(tr("Connection terminated") + "\n\n" +
+                                                 tr("Error code: %1").arg(errorCode, hexError ? 8 : 0, hexError ? 16 : 10, QChar('0')));
         break;
     }
 
@@ -536,7 +541,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 }
 
 Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
-    : m_Preferences(preferences ? preferences : new StreamingPreferences(this)),
+    : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
       m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment()),
       m_Computer(computer),
       m_App(app),
@@ -545,8 +550,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_DecoderLock(0),
       m_AudioDisabled(false),
       m_AudioMuted(false),
-      m_DisplayOriginX(0),
-      m_DisplayOriginY(0),
+      m_QtWindow(nullptr),
       m_UnexpectedTermination(true), // Failure prior to streaming is unexpected
       m_InputHandler(nullptr),
       m_MouseEmulationRefCount(0),
@@ -562,6 +566,21 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
 
 bool Session::initialize()
 {
+#ifdef Q_OS_DARWIN
+    // Using modesetting on modern versions of macOS is extremely unreliable
+    // and leads to hangs, deadlocks, and other nasty stuff. The only time
+    // people seem to use it is to get the full screen on notched Macs,
+    // which setting SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES=1 also accomplishes
+    // with much less headache.
+    //
+    // https://github.com/moonlight-stream/moonlight-qt/issues/973
+    // https://github.com/moonlight-stream/moonlight-qt/issues/999
+    // https://github.com/moonlight-stream/moonlight-qt/issues/1211
+    // https://github.com/moonlight-stream/moonlight-qt/issues/1218
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES,
+                m_Preferences->windowMode == StreamingPreferences::WM_FULLSCREEN ? "0" : "1");
+#endif
+
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s",
@@ -598,13 +617,18 @@ bool Session::initialize()
     m_StreamConfig.height = m_Preferences->height;
     m_StreamConfig.fps = m_Preferences->fps;
     m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
-    m_StreamConfig.hevcBitratePercentageMultiplier = 75;
-    m_StreamConfig.av1BitratePercentageMultiplier = 65;
 
 #ifndef STEAM_LINK
-    // Enable audio encryption as long as we're not on Steam Link.
-    // That hardware can hardly handle Opus decoding at all.
-    m_StreamConfig.encryptionFlags = ENCFLG_AUDIO;
+    // Opt-in to all encryption features if we detect that the platform
+    // has AES cryptography acceleration instructions and more than 2 cores.
+    if (StreamUtils::hasFastAes() && SDL_GetCPUCount() > 2) {
+        m_StreamConfig.encryptionFlags = ENCFLG_ALL;
+    }
+    else {
+        // Enable audio encryption as long as we're not on Steam Link.
+        // That hardware can hardly handle Opus decoding at all.
+        m_StreamConfig.encryptionFlags = ENCFLG_AUDIO;
+    }
 #endif
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -718,6 +742,15 @@ bool Session::initialize()
         if (m_Preferences->enableHdr) {
             m_StreamConfig.supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN10;
         }
+
+        // We'll try to fall back to HEVC first if AV1 fails. We'd rather not fall back
+        // straight to H.264 if the user asked for AV1 and the host doesn't support it.
+        if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_MAIN8) {
+            m_StreamConfig.supportedVideoFormats |= VIDEO_FORMAT_H265;
+        }
+        if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_MAIN10) {
+            m_StreamConfig.supportedVideoFormats |= VIDEO_FORMAT_H265_MAIN10;
+        }
         break;
     }
 
@@ -732,7 +765,12 @@ bool Session::initialize()
         }
         // Fall-through
     case StreamingPreferences::WM_FULLSCREEN:
+#ifdef Q_OS_DARWIN
+        // Don't use "real" fullscreen on macOS. See comments above.
+        m_FullScreenFlag = SDL_WINDOW_FULLSCREEN_DESKTOP;
+#else
         m_FullScreenFlag = SDL_WINDOW_FULLSCREEN;
+#endif
         break;
     }
 
@@ -814,21 +852,13 @@ bool Session::validateLaunch(SDL_Window* testWindow)
                 emitLaunchWarning(tr("Your host software or GPU doesn't support encoding AV1."));
             }
 
-            // We'll try to fall back to HEVC first if AV1 fails. We'd rather not fall back
-            // straight to H.264 if the user asked for AV1 and the host doesn't support it.
-            if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_MAIN8) {
-                m_StreamConfig.supportedVideoFormats |= VIDEO_FORMAT_H265;
-            }
-            if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_MAIN10) {
-                m_StreamConfig.supportedVideoFormats |= VIDEO_FORMAT_H265_MAIN10;
-            }
-
             // Moonlight-common-c will handle this case already, but we want
             // to set this explicitly here so we can do our hardware acceleration
             // check below.
             m_StreamConfig.supportedVideoFormats &= ~VIDEO_FORMAT_MASK_AV1;
         }
-        else if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
+        else if (!m_Preferences->enableHdr && // HDR is checked below
+                 m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
                  m_Preferences->videoCodecConfig != StreamingPreferences::VCC_AUTO && // Auto VCC is already checked in initialize()
                  !isHardwareDecodeAvailable(testWindow,
                                             m_Preferences->videoDecoderSelection,
@@ -851,7 +881,8 @@ bool Session::validateLaunch(SDL_Window* testWindow)
             // check below.
             m_StreamConfig.supportedVideoFormats &= ~VIDEO_FORMAT_MASK_H265;
         }
-        else if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
+        else if (!m_Preferences->enableHdr && // HDR is checked below
+                 m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
                  m_Preferences->videoCodecConfig != StreamingPreferences::VCC_AUTO && // Auto VCC is already checked in initialize()
                  !isHardwareDecodeAvailable(testWindow,
                                             m_Preferences->videoDecoderSelection,
@@ -1086,26 +1117,38 @@ void Session::getWindowDimensions(int& x, int& y,
     // Create our window on the same display that Qt's UI
     // was being displayed on.
     else {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Qt UI screen is at (%d,%d)",
-                    m_DisplayOriginX, m_DisplayOriginY);
-        for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
-            SDL_Rect displayBounds;
+        Q_ASSERT(m_QtWindow != nullptr);
+        if (m_QtWindow != nullptr) {
+            QScreen* screen = m_QtWindow->screen();
+            if (screen != nullptr) {
+                QRect displayRect = screen->geometry();
 
-            if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
-                if (displayBounds.x == m_DisplayOriginX &&
-                        displayBounds.y == m_DisplayOriginY) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "SDL found matching display %d",
-                                i);
-                    displayIndex = i;
-                    break;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Qt UI screen is at (%d,%d)",
+                            displayRect.x(), displayRect.y());
+                for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
+                    SDL_Rect displayBounds;
+
+                    if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
+                        if (displayBounds.x == displayRect.x() &&
+                            displayBounds.y == displayRect.y()) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "SDL found matching display %d",
+                                        i);
+                            displayIndex = i;
+                            break;
+                        }
+                    }
+                    else {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "SDL_GetDisplayBounds(%d) failed: %s",
+                                    i, SDL_GetError());
+                    }
                 }
             }
             else {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "SDL_GetDisplayBounds(%d) failed: %s",
-                            i, SDL_GetError());
+                            "Qt window is not associated with a QScreen!");
             }
         }
     }
@@ -1472,10 +1515,9 @@ public:
     Session* m_Session;
 };
 
-void Session::exec(int displayOriginX, int displayOriginY)
+void Session::exec(QWindow* qtWindow)
 {
-    m_DisplayOriginX = displayOriginX;
-    m_DisplayOriginY = displayOriginY;
+    m_QtWindow = qtWindow;
 
     // Use a separate thread for the streaming session on X11 or Wayland
     // to ensure we don't stomp on Qt's GL context. This breaks when using
@@ -1579,19 +1621,36 @@ void Session::execInternal()
     // We always want a resizable window with High DPI enabled
     Uint32 defaultWindowFlags = SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
 
-    // If we're starting in windowed mode and the Moonlight GUI is maximized,
-    // match that with the streaming window.
-    if (!m_IsFullScreen) {
-        QWindowList windows = QGuiApplication::topLevelWindows();
-        for (const QWindow* window : windows) {
-            if (window->windowState() & Qt::WindowMaximized) {
-                defaultWindowFlags |= SDL_WINDOW_MAXIMIZED;
-                break;
-            }
+    // If we're starting in windowed mode and the Moonlight GUI is maximized or
+    // minimized, match that with the streaming window.
+    if (!m_IsFullScreen && m_QtWindow != nullptr) {
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+        // Qt 5.10+ can propagate multiple states together
+        if (m_QtWindow->windowStates() & Qt::WindowMaximized) {
+            defaultWindowFlags |= SDL_WINDOW_MAXIMIZED;
         }
+        if (m_QtWindow->windowStates() & Qt::WindowMinimized) {
+            defaultWindowFlags |= SDL_WINDOW_MINIMIZED;
+        }
+#else
+        // Qt 5.9 only supports a single state at a time
+        if (m_QtWindow->windowState() == Qt::WindowMaximized) {
+            defaultWindowFlags |= SDL_WINDOW_MAXIMIZED;
+        }
+        else if (m_QtWindow->windowState() == Qt::WindowMinimized) {
+            defaultWindowFlags |= SDL_WINDOW_MINIMIZED;
+        }
+#endif
     }
 
+    // We use only the computer name on macOS to match Apple conventions where the
+    // app name is featured in the menu bar and the document name is in the title bar.
+#ifdef Q_OS_DARWIN
+    std::string windowName = QString(m_Computer->name).toStdString();
+#else
     std::string windowName = QString(m_Computer->name + " - Moonlight").toStdString();
+#endif
+
     m_Window = SDL_CreateWindow(windowName.c_str(),
                                 x,
                                 y,
@@ -1624,16 +1683,13 @@ void Session::execInternal()
 
     // HACK: Remove once proper Dark Mode support lands in SDL
 #ifdef Q_OS_WIN32
-    {
-        BOOL darkModeEnabled = FALSE;
+    if (m_QtWindow != nullptr) {
+        BOOL darkModeEnabled;
 
         // Query whether dark mode is enabled for our Qt window (which tracks the OS dark mode state)
-        QWindowList windows = QGuiApplication::topLevelWindows();
-        for (const QWindow* window : windows) {
-            if (SUCCEEDED(DwmGetWindowAttribute((HWND)window->winId(), DWMWA_USE_IMMERSIVE_DARK_MODE, &darkModeEnabled, sizeof(darkModeEnabled))) ||
-                    SUCCEEDED(DwmGetWindowAttribute((HWND)window->winId(), DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, &darkModeEnabled, sizeof(darkModeEnabled)))) {
-                break;
-            }
+        if (FAILED(DwmGetWindowAttribute((HWND)m_QtWindow->winId(), DWMWA_USE_IMMERSIVE_DARK_MODE, &darkModeEnabled, sizeof(darkModeEnabled))) &&
+            FAILED(DwmGetWindowAttribute((HWND)m_QtWindow->winId(), DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, &darkModeEnabled, sizeof(darkModeEnabled)))) {
+            darkModeEnabled = FALSE;
         }
 
         SDL_SysWMinfo info;
@@ -1908,6 +1964,52 @@ void Session::execInternal()
                 break;
             }
 
+            // Allow the renderer to handle the state change without being recreated
+            if (m_VideoDecoder) {
+                bool forceRecreation = false;
+
+                WINDOW_STATE_CHANGE_INFO windowChangeInfo = {};
+                windowChangeInfo.window = m_Window;
+
+                if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                    windowChangeInfo.stateChangeFlags |= WINDOW_STATE_CHANGE_SIZE;
+
+                    windowChangeInfo.width = event.window.data1;
+                    windowChangeInfo.height = event.window.data2;
+                }
+
+                int newDisplayIndex = SDL_GetWindowDisplayIndex(m_Window);
+                if (newDisplayIndex != currentDisplayIndex) {
+                    windowChangeInfo.stateChangeFlags |= WINDOW_STATE_CHANGE_DISPLAY;
+
+                    windowChangeInfo.displayIndex = newDisplayIndex;
+
+                    // If the refresh rates have changed, we will need to go through the full
+                    // decoder recreation path to ensure Pacer is switched to the new display
+                    // and that we apply any V-Sync disablement rules that may be needed for
+                    // this display.
+                    SDL_DisplayMode oldMode, newMode;
+                    if (SDL_GetCurrentDisplayMode(currentDisplayIndex, &oldMode) < 0 ||
+                            SDL_GetCurrentDisplayMode(newDisplayIndex, &newMode) < 0 ||
+                            oldMode.refresh_rate != newMode.refresh_rate) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Forcing renderer recreation due to refresh rate change between displays");
+                        forceRecreation = true;
+                    }
+                }
+
+                if (!forceRecreation && m_VideoDecoder->notifyWindowChanged(&windowChangeInfo)) {
+                    // Update the window display mode based on our current monitor
+                    // NB: Avoid a useless modeset by only doing this if it changed.
+                    if (newDisplayIndex != currentDisplayIndex) {
+                        currentDisplayIndex = newDisplayIndex;
+                        updateOptimalWindowDisplayMode();
+                    }
+
+                    break;
+                }
+            }
+
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Recreating renderer for window event: %d (%d %d)",
                         event.window.event,
@@ -2079,6 +2181,31 @@ DispatchDeferredCleanup:
     delete m_VideoDecoder;
     m_VideoDecoder = nullptr;
     SDL_AtomicUnlock(&m_DecoderLock);
+
+    // Propagate state changes from the SDL window back to the Qt window
+    //
+    // NB: We're making a conscious decision not to propagate the maximized
+    // or normal state of the window here. The thinking is that users may
+    // routinely maximize the streaming window simply to view the stream
+    // in a larger window, but they don't necessarily want the UI in such
+    // a large window.
+    if (!m_IsFullScreen && m_QtWindow != nullptr && m_Window != nullptr) {
+#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
+        if (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_MINIMIZED) {
+            m_QtWindow->setWindowStates(m_QtWindow->windowStates() | Qt::WindowMinimized);
+        }
+        else if (m_QtWindow->windowStates() & Qt::WindowMinimized) {
+            m_QtWindow->setWindowStates(m_QtWindow->windowStates() & ~Qt::WindowMinimized);
+        }
+#else
+        if (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_MINIMIZED) {
+            m_QtWindow->setWindowState(Qt::WindowMinimized);
+        }
+        else if (m_QtWindow->windowState() & Qt::WindowMinimized) {
+            m_QtWindow->setWindowState(Qt::WindowNoState);
+        }
+#endif
+    }
 
     // This must be called after the decoder is deleted, because
     // the renderer may want to interact with the window
